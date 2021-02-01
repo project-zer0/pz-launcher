@@ -2,7 +2,7 @@ name: docker-ci
 
 on:
   push:
-    branches: master
+    branches: main
 
 jobs:
   main:
@@ -26,7 +26,7 @@ jobs:
         uses: docker/build-push-action@v2
         with:
           push: true
-          tags: projectzer0/pz-laumcher:latest
+          tags: projectzer0/pz-launcher:latest
       -
         name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
