@@ -8,6 +8,8 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/moby/moby/pkg/jsonmessage"
+	"github.com/moby/term"
 	"github.com/pkg/browser"
 	goridgeRpc "github.com/spiral/goridge/v3/pkg/rpc"
 	"golang.org/x/crypto/ssh/terminal"
@@ -224,7 +226,10 @@ func PullImage(cli *client.Client, ctx context.Context, dockerImage string) {
 		panic(err)
 	}
 
-	io.Copy(os.Stdout, reader)
+	defer reader.Close()
+
+	termFd, isTerm := term.GetFdInfo(os.Stderr)
+	jsonmessage.DisplayJSONMessagesStream(reader, os.Stderr, termFd, isTerm, nil)
 }
 
 type PzConfig struct {
