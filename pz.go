@@ -18,6 +18,13 @@ import (
 	"time"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+	builtBy = "unknown"
+)
+
 func main() {
 	if _, err := os.Stat("./.pz.yaml"); os.IsNotExist(err) {
 		fmt.Printf("Missing \"./.pz.yaml\" file.\r\n")
@@ -93,6 +100,8 @@ func runDocker(dockerCli *command.DockerCli, dockerImage string, dockerEntrypoin
 		"PZ_PWD=" + currentDir,
 		"-e",
 		fmt.Sprintf("PZ_PORT=%d", ipcPort),
+		"-e",
+		"PZ_LAUNCHER_VERSION=" + version,
 		"--entrypoint=" + dockerEntrypoint,
 		"-v",
 		currentDir + ":/project",
