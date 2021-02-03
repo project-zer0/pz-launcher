@@ -1,26 +1,20 @@
 package main
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/moby/moby/pkg/jsonmessage"
-	"github.com/moby/term"
+	"github.com/docker/cli/cli"
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/command/container"
+	cliflags "github.com/docker/cli/cli/flags"
 	"github.com/pkg/browser"
 	goridgeRpc "github.com/spiral/goridge/v3/pkg/rpc"
-	"golang.org/x/crypto/ssh/terminal"
 	"gopkg.in/yaml.v3"
-	"io"
 	"io/ioutil"
-	"log"
+	"math/rand"
 	"net"
 	"net/rpc"
 	"os"
-	"strings"
 	"time"
 )
 
@@ -31,87 +25,95 @@ func main() {
 		os.Exit(1)
 	}
 
-	pzConfig := ReadPzConfig()
+	pzConfig := readPzConfig()
 	dockerImage := pzConfig.ProjectZer0.DockerImage
+	dockerEntrypoint := pzConfig.ProjectZer0.DockerEntrypoint
 	if len(dockerImage) <= 0 {
 		dockerImage = "projectzer0/pz-launcher"
 	}
+	if len(dockerEntrypoint) <= 0 {
+		dockerEntrypoint = "/project/vendor/project-zer0/pz/docker/docker-entrypoint.sh"
+	}
 
-	ctx := context.Background()
 	done := make(chan struct{})
 
-	go listenIPCServer(done)
+	var ipcPort = randomTCPPort()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	go listenIPCServer(ipcPort, done)
+
+	dockerCli, err := command.NewDockerCli()
 	if err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, err)
+
+		done <- struct{}{}
+
+		os.Exit(1)
 	}
 
-	cont, err := ContainerCreate(cli, ctx, dockerImage)
-
-	waiter, err := cli.ContainerAttach(ctx, cont.ID, types.ContainerAttachOptions{
-		Stream: true,
-		Stdin:  true,
-		Stdout: true,
-		Stderr: true,
-	})
-
-	if err != nil {
-		panic(err)
-	}
-
-	go io.Copy(os.Stdout, waiter.Reader)
-	go io.Copy(os.Stderr, waiter.Reader)
-
-	if err := cli.ContainerStart(ctx, cont.ID, types.ContainerStartOptions{}); err != nil {
-		panic(err)
-	}
-
-	fd := int(os.Stdin.Fd())
-	var oldState *terminal.State
-	if terminal.IsTerminal(fd) {
-		oldState, err = terminal.MakeRaw(fd)
-		if err != nil {
-			panic(err)
-		}
-
-		go func() {
-			for {
-				consoleReader := bufio.NewReaderSize(os.Stdin, 1)
-				input, _ := consoleReader.ReadByte()
-
-				// Ctrl-C = 3
-				if input == 3 {
-					if err := cli.ContainerRemove(ctx, cont.ID, types.ContainerRemoveOptions{
-						Force: true,
-					}); err != nil {
-						panic(err)
-					}
-
-				}
-
-				waiter.Conn.Write([]byte{input})
+	if err := runDocker(dockerCli, dockerImage, dockerEntrypoint, ipcPort); err != nil {
+		done <- struct{}{}
+		if sterr, ok := err.(cli.StatusError); ok {
+			if sterr.Status != "" {
+				fmt.Fprintln(dockerCli.Err(), sterr.Status)
 			}
-		}()
-	}
-
-	statusCh, errCh := cli.ContainerWait(ctx, cont.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			panic(err)
+			// StatusError should only be used for errors, and all errors should
+			// have a non-zero exit status, so never exit with 0
+			if sterr.StatusCode == 0 {
+				os.Exit(1)
+			}
+			os.Exit(sterr.StatusCode)
 		}
-	case <-statusCh:
-	}
+		fmt.Fprintln(dockerCli.Err(), err)
 
-	if terminal.IsTerminal(fd) {
-		terminal.Restore(fd, oldState)
+		os.Exit(1)
 	}
 
 	done <- struct{}{}
 }
 
-type PzApp struct {}
+func runDocker(dockerCli *command.DockerCli, dockerImage string, dockerEntrypoint string, ipcPort int) error {
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	cmd := container.NewRunCommand(dockerCli)
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+
+	var opts = cliflags.NewClientOptions()
+	opts.Common.SetDefaultOptions(cmd.Flags())
+
+	if err := dockerCli.Initialize(opts); err != nil {
+		return err
+	}
+
+	var defaultArgs = []string{
+		"-e",
+		"PZ_PWD=" + currentDir,
+		"-e",
+		fmt.Sprintf("PZ_PORT=%d", ipcPort),
+		"--entrypoint=" + dockerEntrypoint,
+		"-v",
+		currentDir + ":/project",
+		"-v",
+		currentDir + "/.pz/.docker:/root/.docker",
+		"-v",
+		"/var/run/docker.sock:/var/run/docker.sock",
+		"-w",
+		"/project",
+		"--rm",
+		"-it",
+		dockerImage,
+	}
+
+	cmd.SetArgs(append(defaultArgs, os.Args[1:]...))
+
+	return cmd.Execute()
+}
+
+type PzApp struct{}
+
 func (s *PzApp) OpenURL(payload string, r *string) error {
 	type Json struct {
 		Url string `json:"url"`
@@ -131,8 +133,45 @@ func (s *PzApp) OpenURL(payload string, r *string) error {
 	return nil
 }
 
-func listenIPCServer(done chan struct{}) {
-	addr, err := net.ResolveTCPAddr("tcp", ":45666")
+const (
+	minTCPPort         = 0
+	maxTCPPort         = 65535
+	maxReservedTCPPort = 1024
+	maxRandTCPPort     = maxTCPPort - (maxReservedTCPPort + 1)
+)
+
+var (
+	tcpPortRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
+
+// isTCPPortAvailable returns a flag indicating whether or not a TCP port is
+// available.
+func isTCPPortAvailable(port int) bool {
+	if port < minTCPPort || port > maxTCPPort {
+		return false
+	}
+	conn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// randomTCPPort gets a free, random TCP port between 1025-65535. If no free
+// ports are available -1 is returned.
+func randomTCPPort() int {
+	for i := maxReservedTCPPort; i < maxTCPPort; i++ {
+		p := tcpPortRand.Intn(maxRandTCPPort) + maxReservedTCPPort + 1
+		if isTCPPortAvailable(p) {
+			return p
+		}
+	}
+	return -1
+}
+
+func listenIPCServer(port int, done chan struct{}) {
+	addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		panic(err)
 	}
@@ -169,83 +208,20 @@ func listenIPCServer(done chan struct{}) {
 	}
 }
 
-func ContainerCreate(cli *client.Client, ctx context.Context, dockerImage string) (container.ContainerCreateCreatedBody, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	resp, err := cli.ContainerCreate(ctx, &container.Config{
-		AttachStdin:  true,
-		AttachStdout: true,
-		AttachStderr: true,
-		Tty:          true,
-		OpenStdin:    true,
-		Env: []string{
-			"PZ_PWD=" + dir,
-		},
-		Cmd:        os.Args[1:],
-		Image:      dockerImage,
-		WorkingDir: "/project",
-		Entrypoint: []string{"/project/vendor/project-zer0/pz/docker/docker-entrypoint.sh"},
-	}, &container.HostConfig{
-		AutoRemove: true,
-		Binds: []string{
-			dir + ":/project",
-			dir + "/.pz/.docker:/root/.docker",
-			"/var/run/docker.sock:/var/run/docker.sock",
-		},
-	}, nil, nil, "")
-
-	if err != nil {
-		if !strings.Contains(err.Error(), " No such image") {
-			fmt.Println("Error creating project-zer0/pz container")
-
-			panic(err)
-		}
-
-		PullImage(cli, ctx, dockerImage)
-
-		return ContainerCreate(cli, ctx, dockerImage)
-	}
-
-	return resp, err
-}
-
-func PullImage(cli *client.Client, ctx context.Context, dockerImage string) {
-	fmt.Println("Pulling \"" + dockerImage + "\" image from registry")
-
-	reader, err := cli.ImagePull(
-		ctx,
-		dockerImage,
-		types.ImagePullOptions{},
-	)
-
-	if err != nil {
-		fmt.Println("Error \"" + dockerImage + "\" image from registry")
-		panic(err)
-	}
-
-	defer reader.Close()
-
-	termFd, isTerm := term.GetFdInfo(os.Stderr)
-	jsonmessage.DisplayJSONMessagesStream(reader, os.Stderr, termFd, isTerm, nil)
-}
-
-type PzConfig struct {
+type pzConfig struct {
 	ProjectZer0 struct {
-		DockerImage string `yaml:"launcher_docker_image"`
+		DockerImage      string `yaml:"launcher_docker_image"`
+		DockerEntrypoint string `yaml:"launcher_docker_entrypoint"`
 	} `yaml:"project_zer0"`
 }
 
-
-func ReadPzConfig() PzConfig {
+func readPzConfig() pzConfig {
 	yamlFile, err := ioutil.ReadFile("./.pz.yaml")
 	if err != nil {
 		panic(err)
 	}
 
-	var pzConfig PzConfig
+	var pzConfig pzConfig
 	err = yaml.Unmarshal(yamlFile, &pzConfig)
 	if err != nil {
 		panic(err)
