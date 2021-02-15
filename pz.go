@@ -15,6 +15,8 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -42,6 +44,14 @@ func main() {
 		dockerEntrypoint = "/project/vendor/project-zer0/pz/docker/docker-entrypoint.sh"
 	}
 
+	wslPath := "NULL"
+	if _, err := exec.LookPath("wslpath"); err == nil {
+		cmd := exec.Command("wslpath", "-aw", "./")
+		if result, err := cmd.Output(); err == nil {
+			wslPath = strings.TrimRight(string(result), "\n")
+		}
+	}
+
 	done := make(chan struct{})
 
 	var ipcPort = randomTCPPort()
@@ -57,7 +67,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := runDocker(dockerCli, dockerImage, dockerEntrypoint, ipcPort); err != nil {
+	if err := runDocker(dockerCli, dockerImage, dockerEntrypoint, ipcPort, wslPath); err != nil {
 		done <- struct{}{}
 		if sterr, ok := err.(cli.StatusError); ok {
 			if sterr.Status != "" {
@@ -78,7 +88,7 @@ func main() {
 	done <- struct{}{}
 }
 
-func runDocker(dockerCli *command.DockerCli, dockerImage string, dockerEntrypoint string, ipcPort int) error {
+func runDocker(dockerCli *command.DockerCli, dockerImage string, dockerEntrypoint string, ipcPort int, wslPath string) error {
 	currentDir, err := os.Getwd()
 	if err != nil {
 		return err
@@ -98,6 +108,8 @@ func runDocker(dockerCli *command.DockerCli, dockerImage string, dockerEntrypoin
 	var defaultArgs = []string{
 		"-e",
 		"PZ_PWD=" + currentDir,
+		"-e",
+		"PZ_WSL_PATH=" + wslPath,
 		"-e",
 		fmt.Sprintf("PZ_PORT=%d", ipcPort),
 		"-e",
